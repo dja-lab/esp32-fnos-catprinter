@@ -16,14 +16,29 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 BRIDGE_HOST="${CATBRIDGE_HOST:-192.168.1.21}"
 LAN_RANGE="192.168.1.0/24"
 
-echo "== 1/6 apt packages (cups, avahi)"
+echo "== 1/7 apt packages (cups, avahi, raster deps)"
 if command -v cupsd >/dev/null 2>&1; then
     echo "    cupsd already installed"
 else
     apt-get install -y cups avahi-daemon avahi-utils
 fi
+dpkg -s python3-numpy python3-pil >/dev/null 2>&1 || apt-get install -y python3-numpy python3-pil
 
-echo "== 2/6 cupsd.conf: listen on LAN + allow 192.168.1.0/24"
+echo "== 2/7 catbridge config (/etc/catbridge.conf)"
+if [ ! -f /etc/catbridge.conf ]; then
+    cat > /etc/catbridge.conf <<EOF
+host=$BRIDGE_HOST
+algo=floyd-steinberg
+darkness=8
+speed=8
+feed=128
+EOF
+    echo "    created; edit /etc/catbridge.conf to change"
+else
+    echo "    keeping existing config"
+fi
+
+echo "== 3/7 cupsd.conf: listen on LAN + allow 192.168.1.0/24"
 CONF=/etc/cups/cupsd.conf
 cp -n "$CONF" "$CONF.pre-catbridge" 2>/dev/null || true
 if ! grep -q "^Listen 0.0.0.0:631" "$CONF"; then
@@ -44,20 +59,20 @@ text = re.sub(r"<Location[^>]*>.*?</Location>", add_allow, text, flags=re.S)
 open(conf, "w").write(text)
 PY
 
-echo "== 3/6 catbridge backend -> /usr/lib/cups/backend/"
+echo "== 4/7 catbridge backend -> /usr/lib/cups/backend/"
 install -m 755 "$REPO_DIR/cups-backend/catbridge" /usr/lib/cups/backend/catbridge
 
-echo "== 4/6 CatPrint queue (PPD passthrough image/urf)"
+echo "== 5/7 CatPrint queue (PPD passthrough image/urf)"
 # Fresh state each run: remove an old queue with the same name first.
 lpadmin -x CatPrint 2>/dev/null || true
 lpadmin -p CatPrint -E -v "catbridge://$BRIDGE_HOST" -P "$REPO_DIR/cups/CatPrint.ppd"
 cupsenable CatPrint
 cupsaccept CatPrint
 
-echo "== 5/6 Avahi AirPrint service"
+echo "== 6/7 Avahi AirPrint service"
 install -m 644 "$REPO_DIR/avahi/airprint.service" /etc/avahi/services/airprint.service
 
-echo "== 6/6 restart services"
+echo "== 7/7 restart services"
 systemctl restart cups
 systemctl restart avahi-daemon
 
