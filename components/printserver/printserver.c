@@ -7,10 +7,16 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-/* Internal collaborators declared here to keep one public header. */
-extern esp_err_t ps_mdns_start(const char *instance_name);
-extern esp_err_t ps_mdns_stop(void);
-extern esp_err_t ps_mdns_rename(const char *instance_name);
+/* Bridge build: no AirPrint/mDNS layer (protocol lives on the NAS). The
+ * WebUI can still rename the printer (it labels the status page), and the
+ * mdns stubs keep the public API shape identical to the AirPrint branch. */
+static esp_err_t ps_mdns_start(const char *instance_name)
+{
+    (void)instance_name;
+    return ESP_OK;
+}
+static esp_err_t ps_mdns_stop(void) { return ESP_OK; }
+static esp_err_t ps_mdns_rename(const char *instance_name) { (void)instance_name; return ESP_OK; }
 extern esp_err_t ps_http_start(void);
 extern esp_err_t ps_http_stop(void);
 

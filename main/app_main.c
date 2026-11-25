@@ -1,13 +1,14 @@
 /*
- * Application entry point.
+ * Application entry point (BLE bridge build, branch nas-cups-bridge).
  *
- * Startup: NVS -> WiFi STA -> BLE connect to cat printer -> mDNS + IPP.
- * Job path: iPhone -> IPP Print-Job (ACK) -> URF decode -> 1-bit page buffer
- *           -> BLE 0xAE01 -> cat printer.
+ * Startup: NVS -> WiFi STA -> BLE connect to cat printer -> HTTP bridge.
+ * Job path: NAS CUPS backend -> POST /print (raw URF) -> streaming URF decode
+ *           -> 1-bit page buffer -> BLE 0xAE01 -> cat printer.
  *
- * WiFi and BLE share one 2.4 GHz radio on C3. The two phases are separated:
- * IPP upload finishes before BLE printing starts, so the coexistence window
- * is kept minimal (no architectural changes needed on classic ESP32/S3).
+ * The AirPrint/IPP protocol layer lives on the NAS (see nas/ in the repo root);
+ * this firmware no longer speaks IPP or advertises mDNS. WiFi and BLE share
+ * one 2.4 GHz radio on C3: the upload finishes before BLE printing starts, so
+ * the coexistence window stays minimal.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -138,15 +139,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
 
         /* mDNS/IPP can only bind after we have an interface address, so the
-         * print server is (re)tried from here, not from app_main only. */
+         * bridge HTTP server is (re)tried from here, not from app_main only. */
         if (!s_ps_started) {
             esp_err_t perr = ps_start();
             if (perr == ESP_OK) {
                 s_ps_started = true;
-                ESP_LOGI(TAG, "print server up: AirPrint name '%s'",
-                         CONFIG_AIRPRINT_PRINTER_NAME);
+                ESP_LOGI(TAG, "bridge server up: http://" IPSTR "/ (POST /print = URF)",
+                         IP2STR(&event->ip_info.ip));
             } else {
-                ESP_LOGE(TAG, "print server start failed: %s", esp_err_to_name(perr));
+                ESP_LOGE(TAG, "bridge server start failed: %s", esp_err_to_name(perr));
             }
         }
     }
