@@ -737,3 +737,40 @@ lattice start/end + 页间 feed=0），NAS 版漏掉了这个协议惯例。
 验证：3 页密集 PDF → 1332 行 / 3 会话 / 74955B 全透传（24.7s）。Mac 端
 cupsfilter 复现多页 URF 与后端解码（2 页返回 2 个数组）均正常——
 问题纯在指令流分帧，不在解码或缩放。
+
+## 二十二、封装飞牛 fnOS 应用（2026-11-25 22:19-22:35）
+
+决定：CUPS/Avahi 保持宿主机原生服务（已实战验证），不做容器化——应用只封装
+catbridge 后端安装、打印控制台进程、队列/广播配置和生命周期管理。采用 fnpack
+native 模板（fnpack create --template native）。
+
+### 工程结构（nas/fnos-app/catbridge/）
+- manifest: appname=catbridge, version=1.0.0, display_name=猫打印桥, platform=x86
+- config/privilege: run-as root（要写 /usr/lib/cups、/etc/avahi/services）
+- cmd/install_callback：幂等装机——apt 依赖(cups/avahi/numpy/pil) → backend 安装到
+  /usr/lib/cups/backend → /etc/catbridge.conf（升级保留）→ lpadmin 建/刷新 CatPrint
+  队列 → avahi airprint.service → 退役旧 catbridge-web systemd 单元 → enable cups/avahi
+- cmd/main：管理 :8080 控制台进程（官方 PID 模板），start 时顺带 enable cups/avahi
+- cmd/uninstall_init：删队列/backend/广播文件，保留 /etc/catbridge.conf
+- app/bin/{bridge_web.py,catbridge}、app/cups/CatPrint.ppd、app/avahi/airprint.service
+- app/ui/config：桌面图标 → http://<nas>:8080（猫图标 PIL 生成）
+- bridge_web.py 加 CATBRIDGE_HOST_IP 环境变量覆盖（容器/主机场景通吃）
+
+### 验证（NAS 实机，模拟 appcenter 调用）
+- install_callback 幂等迁移 OK（队列已存在→仅刷新 PPD；旧 systemd 控制台退役）
+- main start/status/stop 全绿（PID 跟踪、跨会话、停止后端口关闭）
+- 控制台 /api/status（ESP32 实时状态）、/api/save 保存往返 OK
+- 打印链路不受影响（echo | lp → 905B 透传 OK）
+
+### 产物与安装
+- nas/fnos-app/catbridge-1.0.0.fpk（22KB）
+- 安装：飞牛桌面 → 应用中心 → 右上角设置 → 手动安装应用 → 选 fpk
+- 升级流程：改 manifest version → 重跑 fnpack build → 覆盖安装
+- fnpack build 在 NAS 上执行（cd 到工程目录）；同步源码用 tar（保留 755 权限）
+
+### 注意
+- appcenter 环境变量 TRIM_APPDEST/TRIM_PKGVAR 由 fnOS 注入；install/main 都有
+  mkdir -p TRIM_PKGVAR 加固
+- 测试 TRIM 变量时 env 前缀必须逐条命令带（sh -c 里只作用第一条）
+- 旧原生 catbridge-web systemd 服务已被应用接管（卸载应用后如需恢复跑
+  nas/setup.sh 或手动装回）

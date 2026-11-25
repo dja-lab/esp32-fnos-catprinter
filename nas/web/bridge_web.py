@@ -157,6 +157,20 @@ def cups_queue():
         return ["(lpstat 不可用)"]
 
 
+def host_ip():
+    """LAN IP for doc links. Containers get it via CATBRIDGE_HOST_IP env
+    (hostname -I inside a container reports the internal bridge IP)."""
+    ip = os.environ.get("CATBRIDGE_HOST_IP")
+    if ip:
+        return ip
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True,
+                             text=True, timeout=3).stdout.split()
+        return out[0] if out else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet
         pass
@@ -173,9 +187,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             html = PAGE.replace("__ESP__", read_conf()["host"]) \
-                       .replace("__HOST__", subprocess.run(
-                           ["hostname", "-I"], capture_output=True, text=True,
-                           timeout=3).stdout.split()[0] if True else "")
+                       .replace("__HOST__", host_ip())
             body = html.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AirPrint advertisement for the NAS-side CatPrint queue.
+     Install to /etc/avahi/services/airprint.service and restart avahi-daemon.
+     Clients resolve this to <NAS-IP>:631 and talk IPP to cupsd, which serves
+     the CatPrint queue; the queue's catbridge backend relays the URF raster
+     to the ESP32 BLE bridge. -->
+<service-group>
+  <name replace-wildcards="no">CatPrint</name>
+  <service>
+    <type>_ipp._tcp</type>
+    <subtype>_universal._sub._ipp._tcp</subtype>
+    <port>631</port>
+    <txt-record>rp=printers/CatPrint</txt-record>
+    <txt-record>ty=CatPrint</txt-record>
+    <txt-record>pdl=image/urf</txt-record>
+    <txt-record>URF=CP1,SRGB24,RS300,FB8</txt-record>
+    <txt-record>note=BLE cat printer via NAS bridge</txt-record>
+    <txt-record>adminurl=http://192.168.1.17:631/printers/CatPrint</txt-record>
+    <txt-record>air=yes</txt-record>
+    <txt-record>qtotal=1</txt-record>
+    <txt-record>priority=60</txt-record>
+  </service>
+</service-group>

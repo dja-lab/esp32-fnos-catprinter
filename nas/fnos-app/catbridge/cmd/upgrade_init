@@ -1,0 +1,4 @@
+#!/bin/bash
+
+### Called before upgrade. install_callback re-provisions everything.
+exit 0

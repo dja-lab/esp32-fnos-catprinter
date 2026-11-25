@@ -1,0 +1,64 @@
+#!/bin/bash
+
+### Called after install: provision the host-side print stack.
+### Idempotent - safe to re-run on upgrade.
+
+set -x
+APP="${TRIM_APPDEST}"
+LOG="${TRIM_PKGVAR}/install.log"
+mkdir -p "${TRIM_PKGVAR}"
+exec >> "${LOG}" 2>&1
+
+echo "==== catbridge install $(date) ===="
+
+# ---- 1. dependencies (cups + avahi are system services, numpy/PIL for the
+#         raster backend) -----------------------------------------------
+if ! command -v cupsd >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y --no-install-recommends cups avahi-daemon avahi-utils
+fi
+python3 -c 'import numpy, PIL' 2>/dev/null || {
+    apt-get update -qq
+    apt-get install -y --no-install-recommends python3-numpy python3-pil
+}
+
+# ---- 2. CUPS backend (the whole raster pipeline) ----------------------
+install -m 755 -o root -g lp "${APP}/bin/catbridge" /usr/lib/cups/backend/catbridge
+
+# ---- 3. config (keep the existing one on upgrade) ---------------------
+if [ ! -f /etc/catbridge.conf ]; then
+    cat > /etc/catbridge.conf <<'CONF'
+# CatPrint bridge settings (edited via NAS console :8080)
+host=192.168.1.21
+algo=floyd-steinberg
+darkness=8
+speed=8
+feed=128
+CONF
+fi
+
+# ---- 4. print queue (create once, refresh PPD if it exists) -----------
+BRIDGE_HOST=$(grep '^host=' /etc/catbridge.conf | cut -d= -f2 | tr -d ' ')
+if ! lpstat -p CatPrint >/dev/null 2>&1; then
+    lpadmin -p CatPrint -E -v "catbridge://${BRIDGE_HOST:-192.168.1.21}" \
+            -P "${APP}/cups/CatPrint.ppd" -D "CatPrint BLE bridge"
+    lpoptions -p CatPrint -l >/dev/null 2>&1 || true
+else
+    lpadmin -p CatPrint -P "${APP}/cups/CatPrint.ppd" || true
+fi
+
+# ---- 5. AirPrint advertisement (host avahi; points at host :631) ------
+install -m 644 "${APP}/avahi/airprint.service" /etc/avahi/services/airprint.service
+
+# ---- 6. retire the old native console systemd unit (app owns it now) --
+systemctl disable --now catbridge-web >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/catbridge-web.service
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+# ---- 7. bring the stack up -------------------------------------------
+systemctl enable --now cups cups.socket
+systemctl enable --now avahi-daemon avahi-daemon.socket
+systemctl restart avahi-daemon
+
+echo "==== install done ===="
+exit 0

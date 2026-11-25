@@ -1,0 +1,4 @@
+#!/bin/bash
+
+### Called after uninstall: nothing to do (cleanup happened in uninstall_init).
+exit 0

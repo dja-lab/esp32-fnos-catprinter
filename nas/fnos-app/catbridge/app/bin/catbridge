@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""CUPS backend: catbridge://<esp32-host>  ->  raster pipeline on the NAS.
+
+Installed as /usr/lib/cups/backend/catbridge on the NAS. CUPS hands us an
+image/urf document (the PPD's *cupsFilter2 passes the client raster through
+unchanged) and this script does ALL the raster work the firmware used to do:
+
+    UNIRAST decode -> per-page blank trim -> stitch pages (continuous roll,
+    regardless of the paper the client picked) -> area-average scale to the
+    384-dot head width -> binarization (catprinter algos) -> full BLE command
+    stream (frames + CRC8, settings from /etc/catbridge.conf) -> POST /raw
+
+The ESP32 bridge firmware only relays those bytes over BLE (POST /raw).
+Binarization algorithms (same names as rbaron/catprinter):
+    floyd-steinberg | atkinson | halftone | mean-threshold | none
+
+Called by cupsd in two ways:
+  no args            -> discovery: list the configured bridge device
+  7 args             -> print: job-id user title copies options <file>
+  6 args             -> print: job data arrives on stdin (CUPS stdin mode)
+
+Debug without CUPS:
+  catbridge --dump <file.urf> > out.bin     (build stream, don't POST)
+"""
+import math
+import os
+import sys
+import urllib.error
+import urllib.request
+
+import numpy as np
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
+
+CONFIG_PATH = "/etc/catbridge.conf"
+UPLOAD_TIMEOUT_S = 600
+
+PRINT_WIDTH = 384
+ROW_BYTES = PRINT_WIDTH // 8          # 48
+
+# ---- printer protocol constants (mirror printer_protocol.h) ---------------
+FRAME_H0, FRAME_H1, FRAME_TAIL = 0x51, 0x78, 0xFF
+CMD_RETRACT, CMD_FEED, CMD_DRAW_BITMAP = 0xA0, 0xA1, 0xA2
+CMD_GET_STATE, CMD_SET_DPI, CMD_UPDATE_DEVICE = 0xA3, 0xA4, 0xA9
+CMD_LATTICE, CMD_SET_ENERGY, CMD_APPLY_ENERGY, CMD_SET_SPEED = 0xA6, 0xAF, 0xBE, 0xBD
+
+LATTICE_START = bytes([0xAA, 0x55, 0x17, 0x38, 0x44, 0x5F, 0x5F, 0x5F, 0x44, 0x38, 0x2C])
+LATTICE_END = bytes([0xAA, 0x55, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17])
+
+_CRC8 = np.array([0], dtype=np.uint8).repeat(256)
+for _i in range(256):
+    _c = _i
+    for _ in range(8):
+        _c = ((_c << 1) ^ 0x07) & 0xFF if (_c & 0x80) else (_c << 1) & 0xFF
+    _CRC8[_i] = _c
+_BITREV = np.array([int(format(i, "08b")[::-1], 2) for i in range(256)], dtype=np.uint8)
+
+
+def crc8(payload: bytes) -> int:
+    crc = 0
+    for b in payload:
+        crc = int(_CRC8[crc ^ b])
+    return crc
+
+
+def frame(cmd: int, payload: bytes = b"") -> bytes:
+    return bytes([FRAME_H0, FRAME_H1, cmd, 0x00, len(payload), 0x00]) \
+        + payload + bytes([crc8(payload), FRAME_TAIL])
+
+
+def le16(v: int) -> bytes:
+    return bytes([v & 0xFF, (v >> 8) & 0xFF])
+
+
+# ---- configuration ---------------------------------------------------------
+
+def load_conf():
+    conf = {
+        "host": "192.168.1.21",
+        "algo": "floyd-steinberg",
+        "darkness": 8,   # 0..15 -> energy 0x1000..0x5000 (8 = 0x3000, known-good)
+        "speed": 8,
+        "feed": 128,     # trailing blank dots after the job
+    }
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k in conf:
+                    conf[k] = v if k in ("host", "algo") else int(v)
+    except FileNotFoundError:
+        pass
+    return conf
+
+
+# ---- UNIRAST decode (ports urf_stream.c byte-for-byte) ---------------------
+
+_K_NUM_COLORS = [1, 3, 3, 3, 1, 3, 4]      # Apple raster colour spaces 0..6
+_K_WHITE_IS_FF = [1, 1, 0, 1, 1, 1, 0]
+
+
+class UrfError(Exception):
+    pass
+
+
+def _be32(b):
+    return int.from_bytes(b, "big")
+
+
+def decode_urf(data: bytes):
+    """Returns a list of per-page grayscale arrays (uint8, HxW, 255=white)."""
+    if len(data) < 44 or data[:7] != b"UNIRAST":
+        raise UrfError("not a UNIRAST raster (%d bytes)" % len(data))
+    total = _be32(data[8:12]) or 1
+    off = 12
+    pages = []
+    while len(pages) < total:
+        if off + 32 > len(data):
+            raise UrfError("truncated page header")
+        ph = data[off:off + 32]
+        off += 32
+        bits, cs = ph[0], ph[1]
+        width, height = _be32(ph[12:16]), _be32(ph[16:20])
+        if width == 0 or height == 0 or width > 4096:
+            raise UrfError("implausible page %dx%d" % (width, height))
+        nc = _K_NUM_COLORS[cs] if cs < 7 else 1
+        packed = (bits == 1)          # CUPS rastertourf emits real 1bpp rasters:
+                                      # 8 pixels per byte, ceil(width/8) per row
+        if packed:
+            row_bytes = (width + 7) // 8
+            bpp = 1              # RLE opcodes still count single bytes
+        else:
+            bpp = bits // 8 or 1
+            if bpp < nc:
+                bpp *= nc
+            row_bytes = width * bpp
+        white = 0xFF if (cs < 7 and _K_WHITE_IS_FF[cs]) else 0x00
+
+        rows = []          # raw encoded row bytes (row_bytes each)
+        row_idx = 0
+        while row_idx < height:
+            if off >= len(data):
+                raise UrfError("raster truncated: page %d/%d row %d/%d "
+                               "(w=%d h=%d bits=%d cs=%d), consumed %d of %d bytes"
+                               % (len(pages) + 1, total, row_idx, height,
+                                  width, height, bits, cs, off, len(data)))
+            reps = data[off] + 1
+            off += 1
+            buf = bytearray([white]) * row_bytes
+            col = 0
+            while col < row_bytes:
+                if off >= len(data):
+                    raise UrfError("raster truncated mid-row %d: consumed %d of %d bytes"
+                                   % (row_idx, off, len(data)))
+                op = data[off]
+                off += 1
+                if op == 0x80:                      # clear rest of line to white
+                    break
+                if op <= 0x7F:                      # one pixel repeated op+1 times
+                    n = op + 1
+                    px = data[off:off + bpp]
+                    off += bpp
+                    # clamp writes like the firmware does - never let the
+                    # bytearray slice-assignment extend the buffer
+                    while n > 0 and col + bpp <= row_bytes:
+                        buf[col:col + bpp] = px
+                        col += bpp
+                        n -= 1
+                else:                               # literal run of 257-op pixels
+                    for _ in range(257 - op):
+                        px = data[off:off + bpp]
+                        off += bpp
+                        if col + bpp <= row_bytes:
+                            buf[col:col + bpp] = px
+                            col += bpp
+            need = min(reps, height - row_idx)
+            rows.append(bytes(buf))
+            for _ in range(need - 1):
+                rows.append(rows[-1])
+            row_idx += need
+
+        gray = np.empty((len(rows), width), np.uint8)
+        for i, rb in enumerate(rows):
+            if len(rb) != row_bytes:   # defensive: never poison the stack
+                raise UrfError("bad row length at %d: %d != %d" % (i, len(rb), row_bytes))
+            if packed:
+                # CUPS 1bpp: MSB-first bits, 1 = black
+                bitrow = np.unpackbits(np.frombuffer(rb, np.uint8), bitorder="big")
+                gray[i] = np.where(bitrow[:width] != 0, 0, 255)
+            elif bpp >= 3:
+                r = np.frombuffer(rb, np.uint8).reshape(width, bpp)
+                gray[i] = (r[:, 0].astype(np.uint16) * 77
+                           + r[:, 1].astype(np.uint16) * 150
+                           + r[:, 2].astype(np.uint16) * 29) >> 8
+            else:
+                gray[i] = np.frombuffer(rb, np.uint8)[:width]
+        pages.append(gray)
+    return pages
+
+
+# ---- binarization (ports catprinter/img.py) --------------------------------
+
+def _floyd_steinberg(gray: np.ndarray) -> np.ndarray:
+    img = gray.astype(np.int16)
+    h, w = img.shape
+    for y in range(h):
+        row = img[y]
+        for x in range(w):
+            old = row[x]
+            new = 255 if old > 127 else 0
+            err = old - new
+            row[x] = new
+            if x + 1 < w:
+                img[y][x + 1] += err * 7 // 16
+            if y + 1 < h:
+                if x > 0:
+                    img[y + 1][x - 1] += err * 3 // 16
+                img[y + 1][x] += err * 5 // 16
+                if x + 1 < w:
+                    img[y + 1][x + 1] += err // 16
+    return img > 127
+
+
+def _atkinson(gray: np.ndarray) -> np.ndarray:
+    img = gray.astype(np.int16)
+    h, w = img.shape
+    e8 = lambda v: v // 8
+    for y in range(h):
+        for x in range(w):
+            old = img[y][x]
+            new = 255 if old > 127 else 0
+            err = old - new
+            img[y][x] = new
+            if x + 1 < w:
+                img[y][x + 1] += e8(err)
+            if x + 2 < w:
+                img[y][x + 2] += e8(err)
+            if y + 1 < h:
+                if x > 0:
+                    img[y + 1][x - 1] += e8(err)
+                img[y + 1][x] += e8(err)
+                if x + 1 < w:
+                    img[y + 1][x + 1] += e8(err)
+            if y + 2 < h:
+                img[y + 2][x] += e8(err)
+    return img > 127
+
+
+def _halftone(gray: np.ndarray) -> np.ndarray:
+    """Block circles (GravO8 halftone, side=4 jump=4 alpha=3)."""
+    side, jump, alpha = 4, 4, 3
+    h, w = gray.shape
+    ho, wo = side * math.ceil(h / jump), side * math.ceil(w / jump)
+    canvas = np.full((ho, wo), 255, np.uint8)
+    # pre-render filled circles for every possible radius (int, 0..alpha*side/2)
+    cy, cx = side / 2, side / 2
+    yy, xx = np.mgrid[0:side, 0:side]
+    dist = np.sqrt((yy + 0.5 - cy) ** 2 + (xx + 0.5 - cx) ** 2)
+    circles = {r: dist <= r for r in range(0, alpha * side // 2 + 1)}
+    for y in range(0, h, jump):
+        oy = y // jump * side
+        for x in range(0, w, jump):
+            cell = gray[y:y + jump, x:x + jump]
+            intensity = 1.0 - cell.mean() / 255.0
+            radius = int(alpha * intensity * side / 2)
+            if radius > 0:
+                ox = x // jump * side
+                canvas[oy:oy + side, ox:ox + side][circles[radius]] = 0
+    return canvas > 127
+
+
+def binarize(gray: np.ndarray, algo: str) -> np.ndarray:
+    """Returns boolean map, True = BLACK (print) pixels, shape (H, 384)."""
+    if algo == "floyd-steinberg":
+        white = _floyd_steinberg(gray)
+    elif algo == "atkinson":
+        white = _atkinson(gray)
+    elif algo == "halftone":
+        white = _halftone(gray)
+    elif algo == "mean-threshold":
+        white = gray > gray.mean()
+    elif algo == "none":
+        white = gray > 127
+    else:
+        raise UrfError("unknown binarization algo: %s" % algo)
+    return ~white
+
+
+# ---- raster pipeline --------------------------------------------------------
+
+MAX_ROWS_PER_LATTICE = 500   # printer stops feeding past ~1 page in one lattice;
+                             # the firmware always used one session per page
+
+
+def urf_to_row_segments(data: bytes, algo: str):
+    """Returns a list of packed-row byte segments. Each segment becomes one
+    lattice session on the wire (one per page, oversized pages split)."""
+    if Image is None:
+        raise UrfError("PIL missing on this host: apt install python3-pil python3-numpy")
+    pages = decode_urf(data)
+    segments = []
+    for pg in pages:
+        h, w = pg.shape
+        # trim leading/trailing all-white rows (page margins), keep interior
+        blank = (pg == 255).all(axis=1)
+        idx = np.flatnonzero(~blank)
+        if idx.size == 0:
+            continue
+        pg = pg[idx[0]:idx[-1] + 1]
+        h, w = pg.shape
+        out_h = max(1, round(h * PRINT_WIDTH / w))
+        img = Image.fromarray(pg, mode="L").resize((PRINT_WIDTH, out_h), Image.BOX)
+        gray = np.asarray(img, np.uint8)
+
+        black = binarize(gray, algo)
+        packed = np.packbits(black, axis=1).astype(np.uint8)     # MSB-first, 1=black
+        packed = _BITREV[packed]                                  # wire wants LSB-first
+        rows = packed.tobytes()
+        # a taller-than-safe page is split into several lattice sessions;
+        # the caller emits feed=0 between them so the roll stays seamless
+        for i in range(0, len(rows), MAX_ROWS_PER_LATTICE * ROW_BYTES):
+            segments.append(rows[i:i + MAX_ROWS_PER_LATTICE * ROW_BYTES])
+    if not segments:
+        raise UrfError("document contained only blank pages")
+    return segments
+
+
+def build_command_stream(segments, conf) -> bytes:
+    """One full print session per segment (mirrors cp_print_page_ex called
+    once per page with feed=0 for intermediate pages)."""
+    out = bytearray()
+    for idx, seg in enumerate(segments):
+        last = idx == len(segments) - 1
+        out += frame(CMD_GET_STATE, b"\x00")                 # _prepare(): get_state
+        out += frame(CMD_GET_STATE, b"\x00")                 # start_printing (old kind)
+        out += frame(CMD_SET_DPI, b"\x32")                   # set_dpi_as_200
+        energy = 0x1000 + conf["darkness"] * 0x400
+        out += frame(CMD_SET_ENERGY, le16(energy))
+        out += frame(CMD_APPLY_ENERGY, b"\x01")
+        out += frame(CMD_UPDATE_DEVICE, b"\x00")
+        out += frame(CMD_LATTICE, LATTICE_START)
+        for i in range(0, len(seg), ROW_BYTES):
+            out += frame(CMD_DRAW_BITMAP, seg[i:i + ROW_BYTES])
+        out += frame(CMD_LATTICE, LATTICE_END)
+        out += frame(CMD_SET_SPEED, bytes([conf["speed"]]))
+        out += frame(CMD_FEED, le16(0 if not last else conf["feed"]))
+        out += frame(CMD_GET_STATE, b"\x00")
+    return bytes(out)
+
+
+# ---- CUPS backend plumbing --------------------------------------------------
+
+def relay(filename, conf, dump_to=None):
+    if filename and filename != "-":
+        with open(filename, "rb") as f:
+            data = f.read()
+    else:
+        data = sys.stdin.buffer.read()
+
+    print("INFO: catbridge: input %d bytes, head: %s"
+          % (len(data), data[:96].hex()), file=sys.stderr)
+
+    try:
+        segments = urf_to_row_segments(data, conf["algo"])
+    except (UrfError, IndexError, ValueError) as e:
+        print("ERROR: catbridge: raster pipeline failed: %s" % e, file=sys.stderr)
+        return 1
+
+    stream = build_command_stream(segments, conf)
+    nrows = sum(len(s) for s in segments) // ROW_BYTES
+    print("INFO: catbridge: %d rows in %d lattice session(s), %d B stream, algo=%s darkness=%d"
+          % (nrows, len(segments), len(stream), conf["algo"], conf["darkness"]), file=sys.stderr)
+
+    if dump_to:
+        with open(dump_to, "wb") as f:
+            f.write(stream)
+        print("INFO: catbridge: stream written to %s" % dump_to, file=sys.stderr)
+        return 0
+
+    url = "http://%s/raw" % conf["host"]
+    req = urllib.request.Request(url, data=stream,
+                                 headers={"Content-Type": "application/octet-stream"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT_S) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            print("INFO: catbridge: bridge answered %s: %s"
+                  % (resp.status, body[:120]), file=sys.stderr)
+            return 0 if resp.status == 200 else 1
+    except urllib.error.HTTPError as e:
+        print("ERROR: catbridge: bridge rejected the job: HTTP %d (%s)"
+              % (e.code, e.reason), file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 - backend must not crash
+        print("ERROR: catbridge: cannot reach bridge: %s" % e, file=sys.stderr)
+        return 1
+
+
+def discovery(conf):
+    print('network catbridge://%s "CatPrint BLE bridge" "ESP32-C3 BLE Cat Printer"'
+          % conf["host"])
+    return 0
+
+
+def main():
+    conf = load_conf()
+    if len(sys.argv) == 1:
+        return discovery(conf)
+    if len(sys.argv) == 4 and sys.argv[1] == "--dump":
+        return relay(sys.argv[2], conf, dump_to=sys.argv[3])
+    if len(sys.argv) >= 7:
+        return relay(sys.argv[6], conf)
+    if len(sys.argv) == 6:
+        return relay("-", conf)   # CUPS stdin mode
+    print("ERROR: catbridge: bad arguments: %r" % sys.argv, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

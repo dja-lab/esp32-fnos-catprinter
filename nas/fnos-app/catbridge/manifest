@@ -1,0 +1,10 @@
+appname               = catbridge
+version               = 1.0.0
+display_name          = 猫打印桥
+desc                  = CatPrint 热敏打印桥：NAS 端 CUPS(AirPrint) + catbridge 光栅管线（URF 解码/缩放/二值化）+ :8080 打印控制台，经 ESP32 BLE 桥驱动猫打印机。
+platform              = x86
+source                = thirdparty
+maintainer            = dja
+distributor           = dja
+desktop_uidir         = ui
+desktop_applaunchname = catbridge.Application

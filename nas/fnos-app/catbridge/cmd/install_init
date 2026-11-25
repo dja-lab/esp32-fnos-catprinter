@@ -1,0 +1,4 @@
+#!/bin/bash
+
+### Called before install: nothing to prepare.
+exit 0

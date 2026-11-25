@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# CatPrint bridge - native fnOS app.
+# The managed process is the :8080 print console (bridge_web.py).
+# CUPS + avahi are host system services; start/stop make sure the print
+# stack is up, and stop leaves them running (they are system-wide).
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
+
+CMD="python3 ${TRIM_APPDEST}/bin/bridge_web.py"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
+}
+
+check_process() {
+    local pid=$1
+    if kill -0 "${pid}" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if check_process "${pid}"; then
+            return 0
+        else
+            rm -f "${PID_FILE}"
+        fi
+    fi
+    return 1
+}
+
+ensure_print_stack() {
+    # cupsd + avahi are system services (installed by install_callback);
+    # make sure they are enabled and running whenever the app starts.
+    systemctl enable --now cups cups.socket >/dev/null 2>&1 || true
+    systemctl enable --now avahi-daemon avahi-daemon.socket >/dev/null 2>&1 || true
+}
+
+start_process() {
+    if status; then
+        return 0
+    fi
+
+    ensure_print_stack
+
+    log_msg "Starting console ..."
+    # if an old native catbridge-web systemd unit is still around, stop it
+    # so :8080 is free (install_callback removes it, this is belt+braces)
+    systemctl stop catbridge-web >/dev/null 2>&1 || true
+    bash -c "${CMD}" >> ${LOG_FILE} 2>&1 &
+    printf "%s" "$!" > ${PID_FILE}
+    return 0
+}
+
+stop_process() {
+    log_msg "Stopping console ..."
+
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+
+        if ! check_process "${pid}"; then
+            rm -f "${PID_FILE}"
+            return 0
+        fi
+
+        kill -TERM ${pid} >> ${LOG_FILE} 2>&1
+
+        local count=0
+        while check_process "${pid}" && [ $count -lt 10 ]; do
+            sleep 1
+            count=$((count + 1))
+            log_msg "waiting process terminal... (${count}s/10s)"
+        done
+
+        if check_process "${pid}"; then
+            kill -KILL ${pid}
+            sleep 1
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    return 0
+}
+
+case $1 in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

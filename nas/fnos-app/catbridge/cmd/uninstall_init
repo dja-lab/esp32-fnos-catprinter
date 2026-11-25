@@ -1,0 +1,20 @@
+#!/bin/bash
+
+### Called before uninstall: remove app-owned host files, keep user config.
+
+LOG="${TRIM_PKGVAR}/uninstall.log"
+exec >> "${LOG}" 2>&1
+
+echo "==== catbridge uninstall $(date) ===="
+
+# stop console (appcenter calls cmd/main stop as well; belt+braces)
+pkill -f 'bridge_web.py' 2>/dev/null || true
+
+# remove queue + backend + advertisement (CUPS/avahi stay installed)
+lpadmin -x CatPrint >/dev/null 2>&1 || true
+rm -f /usr/lib/cups/backend/catbridge
+rm -f /etc/avahi/services/airprint.service
+systemctl restart avahi-daemon >/dev/null 2>&1 || true
+
+echo "==== uninstall done ===="
+exit 0

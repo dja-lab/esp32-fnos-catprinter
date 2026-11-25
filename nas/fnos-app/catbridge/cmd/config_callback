@@ -1,0 +1,4 @@
+#!/bin/bash
+
+### Called after the user changes env vars in app settings.
+exit 0
