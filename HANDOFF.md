@@ -705,3 +705,17 @@ Mac/iPhone → NAS CUPS (image/urf) → catbridge 后端（NAS 全部 raster 工
 ### 遗留
 - 固件 /print 路径（urf_stream.c）对 1bpp URF 仍按每像素 1 字节解析——主路径已是 /raw 不受影响，如需保留 /print 兼容 CUPS 2.4 客户端需同样修 1bpp。
 - ESP32 WebUI 的 darkness/feed 设置对 /raw 作业无效（设置权移交 NAS 配置）。
+
+## 二十、设置 WebUI 上移 NAS（2026-11-25 21:47-21:58）
+
+### ESP32（精简为桥接终端页）
+- webui_page.h 重写：仅保留 WiFi 配网（扫描/连接/忘记/BSSID 锁定）、BLE 打印机连接（扫描/手动 MAC/绑定当前/断开/解绑）、状态（wifi/ble/sys）、测试页、重启。顶部固定链接跳转 NAS 控制台（Kconfig `CATBRIDGE_WEB_URL`，默认 http://192.168.1.17:8080；webui_page.h 需 `#include "sdkconfig.h"` 才能引用 CONFIG 宏）。
+- webui.c 删除 /api/settings GET+POST；/api/status 瘦身为 wifi/ble/print/sys（去掉 settings blob 与 media）。settings NVS 里的 darkness/speed/feed/orientation 只剩旧 /print URF 路径使用。
+
+### NAS（新增 bridge-web 控制台）
+- `nas/web/bridge_web.py`：stdlib-only HTTP 服务 :8080（systemd `catbridge-web`）。功能：读改 /etc/catbridge.conf（algo/darkness/speed/feed/host，临时文件原子替换，作业启动即生效）、代理 ESP32 /api/status、显示 CUPS 待打队列。页面中文单页，5 秒自动刷新。
+- setup.sh 第 6 步安装到 /opt/catbridge 并 enable --now。
+
+### 验证
+- /api/save 往返（mean-threshold/darkness=9 写入、读回一致、还原）✓
+- ESP32 重启后 BLE 自动重连、Mac 打印 e2e（905B relay ok, heap 62KB）✓
