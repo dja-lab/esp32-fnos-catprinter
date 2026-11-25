@@ -295,11 +295,17 @@ def binarize(gray: np.ndarray, algo: str) -> np.ndarray:
 
 # ---- raster pipeline --------------------------------------------------------
 
-def urf_to_row_bytes(data: bytes, algo: str) -> bytes:
+MAX_ROWS_PER_LATTICE = 500   # printer stops feeding past ~1 page in one lattice;
+                             # the firmware always used one session per page
+
+
+def urf_to_row_segments(data: bytes, algo: str):
+    """Returns a list of packed-row byte segments. Each segment becomes one
+    lattice session on the wire (one per page, oversized pages split)."""
     if Image is None:
         raise UrfError("PIL missing on this host: apt install python3-pil python3-numpy")
     pages = decode_urf(data)
-    scaled = []
+    segments = []
     for pg in pages:
         h, w = pg.shape
         # trim leading/trailing all-white rows (page margins), keep interior
@@ -311,33 +317,41 @@ def urf_to_row_bytes(data: bytes, algo: str) -> bytes:
         h, w = pg.shape
         out_h = max(1, round(h * PRINT_WIDTH / w))
         img = Image.fromarray(pg, mode="L").resize((PRINT_WIDTH, out_h), Image.BOX)
-        scaled.append(np.asarray(img, np.uint8))
-    if not scaled:
+        gray = np.asarray(img, np.uint8)
+
+        black = binarize(gray, algo)
+        packed = np.packbits(black, axis=1).astype(np.uint8)     # MSB-first, 1=black
+        packed = _BITREV[packed]                                  # wire wants LSB-first
+        rows = packed.tobytes()
+        # a taller-than-safe page is split into several lattice sessions;
+        # the caller emits feed=0 between them so the roll stays seamless
+        for i in range(0, len(rows), MAX_ROWS_PER_LATTICE * ROW_BYTES):
+            segments.append(rows[i:i + MAX_ROWS_PER_LATTICE * ROW_BYTES])
+    if not segments:
         raise UrfError("document contained only blank pages")
-    strip = np.vstack(scaled)
-
-    black = binarize(strip, algo)
-    packed = np.packbits(black, axis=1).astype(np.uint8)     # MSB-first, 1=black
-    packed = _BITREV[packed]                                  # wire wants LSB-first
-    return packed.tobytes()
+    return segments
 
 
-def build_command_stream(rows_data: bytes, conf) -> bytes:
+def build_command_stream(segments, conf) -> bytes:
+    """One full print session per segment (mirrors cp_print_page_ex called
+    once per page with feed=0 for intermediate pages)."""
     out = bytearray()
-    out += frame(CMD_GET_STATE, b"\x00")                 # _prepare(): get_state
-    out += frame(CMD_GET_STATE, b"\x00")                 # start_printing (old kind)
-    out += frame(CMD_SET_DPI, b"\x32")                   # set_dpi_as_200
-    energy = 0x1000 + conf["darkness"] * 0x400
-    out += frame(CMD_SET_ENERGY, le16(energy))
-    out += frame(CMD_APPLY_ENERGY, b"\x01")
-    out += frame(CMD_UPDATE_DEVICE, b"\x00")
-    out += frame(CMD_LATTICE, LATTICE_START)
-    for i in range(0, len(rows_data), ROW_BYTES):
-        out += frame(CMD_DRAW_BITMAP, rows_data[i:i + ROW_BYTES])
-    out += frame(CMD_LATTICE, LATTICE_END)
-    out += frame(CMD_SET_SPEED, bytes([conf["speed"]]))
-    out += frame(CMD_FEED, le16(conf["feed"]))
-    out += frame(CMD_GET_STATE, b"\x00")
+    for idx, seg in enumerate(segments):
+        last = idx == len(segments) - 1
+        out += frame(CMD_GET_STATE, b"\x00")                 # _prepare(): get_state
+        out += frame(CMD_GET_STATE, b"\x00")                 # start_printing (old kind)
+        out += frame(CMD_SET_DPI, b"\x32")                   # set_dpi_as_200
+        energy = 0x1000 + conf["darkness"] * 0x400
+        out += frame(CMD_SET_ENERGY, le16(energy))
+        out += frame(CMD_APPLY_ENERGY, b"\x01")
+        out += frame(CMD_UPDATE_DEVICE, b"\x00")
+        out += frame(CMD_LATTICE, LATTICE_START)
+        for i in range(0, len(seg), ROW_BYTES):
+            out += frame(CMD_DRAW_BITMAP, seg[i:i + ROW_BYTES])
+        out += frame(CMD_LATTICE, LATTICE_END)
+        out += frame(CMD_SET_SPEED, bytes([conf["speed"]]))
+        out += frame(CMD_FEED, le16(0 if not last else conf["feed"]))
+        out += frame(CMD_GET_STATE, b"\x00")
     return bytes(out)
 
 
@@ -354,15 +368,15 @@ def relay(filename, conf, dump_to=None):
           % (len(data), data[:96].hex()), file=sys.stderr)
 
     try:
-        rows_data = urf_to_row_bytes(data, conf["algo"])
+        segments = urf_to_row_segments(data, conf["algo"])
     except (UrfError, IndexError, ValueError) as e:
         print("ERROR: catbridge: raster pipeline failed: %s" % e, file=sys.stderr)
         return 1
 
-    stream = build_command_stream(rows_data, conf)
-    nrows = len(rows_data) // ROW_BYTES
-    print("INFO: catbridge: %d rows, %d B command stream, algo=%s darkness=%d"
-          % (nrows, len(stream), conf["algo"], conf["darkness"]), file=sys.stderr)
+    stream = build_command_stream(segments, conf)
+    nrows = sum(len(s) for s in segments) // ROW_BYTES
+    print("INFO: catbridge: %d rows in %d lattice session(s), %d B stream, algo=%s darkness=%d"
+          % (nrows, len(segments), len(stream), conf["algo"], conf["darkness"]), file=sys.stderr)
 
     if dump_to:
         with open(dump_to, "wb") as f:
