@@ -90,4 +90,12 @@ menu "AirPrint Cat Printer"
             C3 无 PSRAM。整页 1-bit 位图约 100KB 可放 SRAM；
             若 iOS 发来的原始 URF 任务过大，可先落 storage 分区再逐行解码。
 
+
+    config CATBRIDGE_WEB_URL
+        string "NAS 控制台地址（打印设置所在的 Web 页）"
+        default "http://192.168.1.17:8080"
+        help
+            方案 B 下打印参数（算法/浓度/速度/走纸）在 NAS 的 bridge-web 服务上，
+            ESP32 首页只显示这个跳转链接。
+
 endmenu

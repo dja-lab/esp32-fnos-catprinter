@@ -87,30 +87,11 @@ static void json_escape(char *dst, size_t cap, const char *src)
 }
 
 /* ---- state -------------------------------------------------------------- */
-static void append_settings(char *b, size_t cap, const app_settings_t *s)
-{
-    size_t o = strlen(b);
-    char esc[128];
-#define JS(field) do { json_escape(esc, sizeof(esc), s->field); \
-        o += (size_t)snprintf(b + o, cap - o, "\"%s\":\"%s\",", #field, esc); } while (0)
-    JS(wifi_ssid);
-    JS(wifi_bssid);
-    JS(airprint_name);
-    JS(ble_prefix);
-    JS(ble_mac);
-#undef JS
-    o += (size_t)snprintf(b + o, cap - o,
-        "\"orientation\":%u,\"darkness\":%u,\"speed\":%u,\"threshold\":%u,"
-        "\"write_delay\":%u,\"feed_pixels\":%u,\"ble_addr_type\":%u,"
-        "\"energy\":%u",
-        s->orientation, s->darkness, s->speed, s->threshold,
-        s->write_delay_ms, s->feed_pixels, s->ble_addr_type,
-        (unsigned)settings_energy());
-}
-
+/* Print-parameter settings live on the NAS console (Plan B); the device UI
+ * only reports WiFi/BLE/system state, which is all a bridge needs. */
 static void api_status(int fd)
 {
-    char *b = (char *)malloc(4096);
+    char *b = (char *)malloc(2048);
     if (b == NULL) { send_fail(fd, 500, "out of memory"); return; }
 
     wifi_mode_t mode = WIFI_MODE_NULL;
@@ -137,48 +118,28 @@ static void api_status(int fd)
     cp_status_t cp;
     cp_get_status(&cp);
     const app_settings_t *s = settings_get();
-    page_buf_t *pb = ps_page_buffer();
 
     char esc[128];
     json_escape(esc, sizeof(esc), s->wifi_ssid);
-    char esc_name[128];
-    json_escape(esc_name, sizeof(esc_name), s->airprint_name);
     char esc_mac[64];
     json_escape(esc_mac, sizeof(esc_mac), s->ble_mac);
     char esc_peer[64];
     json_escape(esc_peer, sizeof(esc_peer), cp_peer_mac());
-    char esc_media[64];
-    json_escape(esc_media, sizeof(esc_media), ps_last_media());
     const char *fw = esp_get_idf_version();
 
-    snprintf(b, 4096,
+    snprintf(b, 2048,
         "{\"ok\":true,"
         "\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"connected\":%s},"
         "\"ble\":{\"state\":%d,\"stateName\":\"%s\",\"mac\":\"%s\",\"mtu\":%u,\"bound\":\"%s\",\"ready\":%s},"
-        "\"print\":{\"active\":%s,\"lastJob\":%u,\"rows\":%u,\"media\":\"%s\"},"
-        "\"sys\":{\"heap\":%u,\"uptime\":%u,\"fw\":\"%s\"},"
-        "\"settings\":{",
+        "\"print\":{\"active\":%s,\"lastJob\":%u},"
+        "\"sys\":{\"heap\":%u,\"uptime\":%u,\"fw\":\"%s\"}}",
         modestr, esc, ip, rssi,
         strcmp(ip, "0.0.0.0") == 0 ? "false" : "true",
         (int)cp.state, settings_ble_state_name((int)cp.state), esc_peer,
         (unsigned)cp.mtu, esc_mac, cp_is_ready() ? "true" : "false",
         ps_job_active() ? "true" : "false", (unsigned)ps_last_job_id(),
-        pb ? (unsigned)pb->nrows : 0u, esc_media,
         (unsigned)esp_get_free_heap_size(),
         (unsigned)(esp_timer_get_time() / 1000000), fw);
-    append_settings(b, 4096, s);
-    snprintf(b + strlen(b), 4096 - strlen(b), "}}");
-    send_json(fd, 200, b);
-    free(b);
-}
-
-static void api_settings(int fd)
-{
-    char *b = (char *)malloc(1024);
-    if (b == NULL) { send_fail(fd, 500, "out of memory"); return; }
-    snprintf(b, 1024, "{\"ok\":true,\"settings\":{");
-    append_settings(b, 1024, settings_get());
-    snprintf(b + strlen(b), 1024 - strlen(b), "}}");
     send_json(fd, 200, b);
     free(b);
 }
@@ -301,36 +262,10 @@ static void schedule_reboot(uint32_t ms)
 }
 
 /* ---- actions ------------------------------------------------------------ */
-static void api_save_settings(int fd, const char *body, size_t len)
-{
-    app_settings_t s;
-    settings_snapshot(&s);
-    char old_name[SETTINGS_NAME_MAX + 1];
-    snprintf(old_name, sizeof(old_name), "%s", s.airprint_name);
-
-    settings_apply_form_into(&s, body, len);
-    esp_err_t e = settings_replace(&s);
-    if (e != ESP_OK) { send_fail(fd, 500, "NVS write failed"); return; }
-    /* Name prefix applies immediately; the AirPrint name is re-announced on the
-     * network right away (Bonjour goodbye + new probe), so no reboot is
-     * needed - iOS only has to refresh its own cache. */
-    cp_set_name_prefix(s.ble_prefix);
-    bool renamed = (strcmp(old_name, s.airprint_name) != 0);
-    if (renamed) {
-        ps_printer_rename(s.airprint_name);
-    }
-    ESP_LOGI(TAG, "settings saved: ori=%s dark=%u speed=%u delay=%ums thr=%u feed=%u%s%s",
-             settings_orientation_name(s.orientation), s.darkness, s.speed,
-             s.write_delay_ms, s.threshold, s.feed_pixels,
-             renamed ? " name=" : "", renamed ? s.airprint_name : "");
-    if (renamed) {
-        send_ok(fd, "已保存，AirPrint 名称已重新广播。iPhone 若仍显示旧名，"
-                    "请到 设置 → 打印机 删除旧条目后重新添加（或开关一次 Wi-Fi）；"
-                    "纸张默认已是 A8，无需在打印面板里选。");
-    } else {
-        send_ok(fd, "设置已保存，打印参数立即生效");
-    }
-}
+/* NOTE: there is no /api/settings endpoint any more. Print parameters
+ * (algorithm/darkness/speed/feed) are owned by the NAS console and live in
+ * /etc/catbridge.conf there; the firmware values in NVS only serve the
+ * legacy /print URF path and its defaults. */
 
 static void api_wifi_connect(int fd, const char *body, size_t len)
 {
@@ -461,8 +396,6 @@ void webui_serve(int fd, const char *path)
                    WEBUI_HTML, strlen(WEBUI_HTML));
     } else if (strcmp(path, "/api/status") == 0) {
         api_status(fd);
-    } else if (strcmp(path, "/api/settings") == 0) {
-        api_settings(fd);
     } else if (strcmp(path, "/api/wifi/scan") == 0) {
         api_wifi_scan(fd);
     } else if (strcmp(path, "/api/printer/scan") == 0) {
@@ -476,9 +409,7 @@ void webui_serve(int fd, const char *path)
 
 void webui_api(int fd, const char *path, const char *body, size_t body_len)
 {
-    if (strcmp(path, "/api/settings") == 0) {
-        api_save_settings(fd, body, body_len);
-    } else if (strcmp(path, "/api/wifi/connect") == 0) {
+    if (strcmp(path, "/api/wifi/connect") == 0) {
         api_wifi_connect(fd, body, body_len);
     } else if (strcmp(path, "/api/wifi/forget") == 0) {
         api_wifi_forget(fd);

@@ -1,0 +1,12 @@
+[Unit]
+Description=CatPrint bridge web console (print settings + status)
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/catbridge/bridge_web.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

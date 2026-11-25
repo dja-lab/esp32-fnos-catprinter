@@ -69,10 +69,17 @@ lpadmin -p CatPrint -E -v "catbridge://$BRIDGE_HOST" -P "$REPO_DIR/cups/CatPrint
 cupsenable CatPrint
 cupsaccept CatPrint
 
-echo "== 6/7 Avahi AirPrint service"
+echo "== 6/7 bridge-web console -> /opt/catbridge + systemd"
+mkdir -p /opt/catbridge
+install -m 755 "$REPO_DIR/web/bridge_web.py" /opt/catbridge/bridge_web.py
+install -m 644 "$REPO_DIR/web/catbridge-web.service" /etc/systemd/system/catbridge-web.service
+systemctl daemon-reload
+systemctl enable --now catbridge-web
+
+echo "== 7/7 Avahi AirPrint service"
 install -m 644 "$REPO_DIR/avahi/airprint.service" /etc/avahi/services/airprint.service
 
-echo "== 7/7 restart services"
+echo "== 8/8 restart services"
 systemctl restart cups
 systemctl restart avahi-daemon
 
