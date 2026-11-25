@@ -666,3 +666,42 @@ W low heap (5372), refusing connection
 ### 已知取舍
 - 页缓冲 800 行意味着「单页输出超过 800 行」会被截断（日志 `page buffer full`）。A4/A6/Letter/4×6 在 300 dpi 下最高 543 行，正常客户端够用；180° 旋转模式（整篇缓冲）超长会截断，该模式本来就是降级路径。
 - 上传仍受限于 Wi-Fi：291 KB 实测 59 s（含 22 s 页间打印停顿），iPhone 直传会更快。
+
+## 十九、raster 管线上移 NAS（方案 B 深化，2026-11-25 21:12-21:42）
+
+需求：解码、缩放（任意纸张→热敏纸宽）、灰度二值化全部放 NAS，ESP32 只做字节透传。
+
+### 架构（分支 nas-cups-bridge，最终形态）
+```
+Mac/iPhone → NAS CUPS (image/urf) → catbridge 后端（NAS 全部 raster 工作）
+  UNIRAST 解码 → 每页裁空白边距 → 多页纵向拼接（连续纸，与所选纸张无关）
+  → area-average 缩放到 384 列 → 二值化（catprinter 算法）→ 生成完整 BLE 指令流
+  （帧+CRC8，darkness/speed/feed 来自 /etc/catbridge.conf）
+→ POST ESP32 /raw → cp_send_raw 透传 0xAE01 → 打印机
+```
+
+### 固件改动（commit 885e952）
+- bridge_server.c 新增 `POST /raw`：body 逐块 `cp_send_raw()`（send_chunked 提供 MTU 分块 + 0xAE02 流控 + 每块写延时），零解码、零缓冲、TCP 背压。s_raw_busy 防并发；/print URF 路径保留兼容。
+
+### NAS 后端重写（commit cddb58b）
+- `nas/cups-backend/catbridge` 成为完整 raster 引擎（Python，numpy+PIL，Debian 包 python3-numpy python3-pil）：
+  - UNIRAST 解码移植 urf_stream.c 语义（行首 repeat 字节 + PackBits 变体 + 0x80 清行尾）；
+  - **关键坑：CUPS 2.4 的 rastertourf 生成真 1bpp 光栅**（bits=1，8 像素/字节打包，行宽 ceil(w/8)），固件的 `bits//8` 每像素一字节假设在此格式上完全错位；Mac CUPS 2.3.4 生成的是 bits=8 sRGB。1bpp：MSB-first、bit 1=黑、解码后展开为灰度；
+  - RLE 写入必须 clamp（Python bytearray 切片越界会扩容，C 语义是丢弃）；
+  - 二值化算法（/etc/catbridge.conf `algo=`）：floyd-steinberg / atkinson / halftone / mean-threshold / none，实现参照 rbaron/catprinter img.py；
+  - 指令流复刻 cp_print_page_ex 序列：get_state ×2 → set_dpi(50) → set_energy(0x1000+darkness*0x400) → apply_energy → update_device → lattice_start → 逐行 draw_row（位反转载荷）→ lattice_end → set_speed → feed → get_state。
+- 配置 `/etc/catbridge.conf`：host / algo / darkness / speed / feed。setup.sh 幂等写。
+
+### 验证
+- NAS lp A6（1bpp 光栅）、`-o media=A4` 强制 A4 多页连续、Mac 文本三路全部打通；ESP32 heap 62KB。
+- 设备端日志：`POST /raw ... raw relay ok`（1633B/289ms、849B/166ms、1409B/249ms）。
+
+### 调试备忘
+- cupsd 有 PrivateTmp，后端写 /tmp 落在命名空间内看不见；
+- backend 的 stderr INFO 级不进 error_log，需 `cupsctl --debug-logging` 临时打开；
+- raster 经 stdin 交付（6 参数模式），spool 的 d 文件只是未过滤原文；
+- 复现生成端差异最有效的办法：Mac `cupsfilter -p PPD -i text/plain -m image/urf -o media=A6`。
+
+### 遗留
+- 固件 /print 路径（urf_stream.c）对 1bpp URF 仍按每像素 1 字节解析——主路径已是 /raw 不受影响，如需保留 /print 兼容 CUPS 2.4 客户端需同样修 1bpp。
+- ESP32 WebUI 的 darkness/feed 设置对 /raw 作业无效（设置权移交 NAS 配置）。
