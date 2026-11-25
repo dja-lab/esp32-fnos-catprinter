@@ -719,3 +719,21 @@ Mac/iPhone → NAS CUPS (image/urf) → catbridge 后端（NAS 全部 raster 工
 ### 验证
 - /api/save 往返（mean-threshold/darkness=9 写入、读回一致、还原）✓
 - ESP32 重启后 BLE 自动重连、Mac 打印 e2e（905B relay ok, heap 62KB）✓
+
+## 二十一、多页只打第一页修复（2026-11-25 22:04-22:16）
+
+现象：多页文档只有第一页出纸（NAS raster 管线时期）。
+
+根因：catbridge 后端把整份文档所有行塞进**一个 lattice 会话**；打印机的行缓冲
+约一页就停。旧固件是多页时每页跑一次完整 cp_print_page_ex（独立 prepare +
+lattice start/end + 页间 feed=0），NAS 版漏掉了这个协议惯例。
+
+修复（nas/cups-backend/catbridge）：
+- urf_to_row_bytes -> urf_to_row_segments：按页产出行段（单页超 500 行再切分）；
+- build_command_stream：每段一个完整会话（get_state x2 → set_dpi → energy →
+  apply → update_device → lattice_start → 行 → lattice_end → set_speed →
+  feed[中间=0 / 最后=conf] → get_state），与固件逐页序列一致。
+
+验证：3 页密集 PDF → 1332 行 / 3 会话 / 74955B 全透传（24.7s）。Mac 端
+cupsfilter 复现多页 URF 与后端解码（2 页返回 2 个数组）均正常——
+问题纯在指令流分帧，不在解码或缩放。
