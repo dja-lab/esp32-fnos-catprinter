@@ -1,0 +1,93 @@
+menu "AirPrint Cat Printer"
+
+    config AIRPRINT_PRINTER_NAME
+        string "mDNS 广播名称 (iPhone 打印列表里显示的名字)"
+        default "CatPrint-C3"
+
+    config AIRPRINT_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+
+    config AIRPRINT_WIFI_PASSWORD
+        string "WiFi 密码"
+        default ""
+
+    config AIRPRINT_WIFI_BSSID
+        string "锁定 BSSID（12 位 hex，留空=自动选最强）"
+        default ""
+        help
+            同一个 SSID 下可能有多个 BSSID（主路由 + 中继/第二个 AP），
+            其中某个的密码或加密设置不同步时会出现「有时能连、有时 auth 超时」。
+            填上实测能连通的 BSSID 可避免随机连到坏的那个。
+            日志里 `WiFi connected: ... via bssid aa:bb:...` 就是可用值。
+
+    config AIRPRINT_TX_POWER_QDBM
+        int "WiFi 最大发射功率 (0.25 dBm/单位，34 = 8.5 dBm)"
+        range 8 84
+        default 34
+        help
+            ESP32-C3 SuperMini 这类小板在满功率(80=20dBm)下，板载陶瓷/PCB 天线
+            容易失真/反射，表现为「能扫到 AP、认证握手失败、偶尔连上几秒就断」。
+            实测把功率压到 34 (8.5 dBm) 即可稳定连接。
+            信号距离不够时再往上调（52=13dBm、68=17dBm），别一上来给 80。
+
+    config AIRPRINT_THRESHOLD
+        int "二值化阈值 (0-255，默认 150)"
+        range 0 255
+        default 150
+        help
+            iOS 发来的是 8 位灰度，打印头只认 1 位。流程是"区域平均下采样 → 阈值"。
+            整页 A4 缩到 384 点等于 6.5 倍缩小，平均之后笔画会变浅，所以阈值要比
+            128 高一些（150）才能保住文字。纸面偏黑/脏就调低，字太淡就调高。
+
+    config AIRPRINT_DEBUG_RASTER_DUMP
+        bool "调试：把解码后的点阵以 ASCII 打到串口"
+        default n
+        help
+            每个打印任务在串口输出 24 行 ASCII 缩略图（每 4 点/行采样），
+            用来对比"设备解出来的图"与"期望的图"。
+            曾经靠它定位到 URF 状态机的 0x00-0x7F 重复像素 bug（整页变条纹）。
+            正常使用请关闭，否则每单多 24 行日志。
+
+    config CATPRINTER_WRITE_DELAY_MS
+        int "每包 BLE 写入间隔 (ms)"
+        range 8 120
+        default 40
+        help
+            无响应写 (write without response) 没有确认，发太快会让打印机丢行 →
+            纸上出现"没规律的条纹"。20 ms 在 iPhone 打印（WiFi 同时高频轮询）时
+            会被打断；40 ms 更稳（翻倍的时间换可靠性）。
+
+    config CATPRINTER_ENERGY
+        hex "打印头能量 (0x1000-0xFFFF，默认 0x3000)"
+        range 0x1000 0xffff
+        default 0x3000
+        help
+            热敏打印头加热能量。NaitLee/Cat-Printer 原文注释：max 是 0xFFFF，
+            但固件默认值约 0x3000（1/5）。用 0xFFFF 且同时下发 apply_energy(0xBE 01)
+            会让每个加热点严重过热，整页糊成全黑并留下水平条纹。
+            调小更淡，调大更黑；超过 0x6000 一般就会开始糊。
+            如偏淡可保持 0xFFFF；若纸偏薄导致发黑/糊，再降到 0xA000 / 0x8000。
+
+    config CATPRINTER_BLE_NAME_PREFIX
+        string "猫打印机 BLE 名称前缀 (GB01 / MX06 / X6h / X6h-0000)"
+        default "GB01"
+
+    config CATPRINTER_DARKNESS
+        int "默认打印浓度 (0-15)"
+        range 0 15
+        default 8
+
+    config CATPRINTER_SPEED
+        int "默认打印速度 (1-15)"
+        range 1 15
+        default 5
+
+    config AIRPRINT_USE_FLASH_SPOOL
+        bool "大任务写入 flash 分区再消费 (SRAM 吃紧时开启)"
+        default y
+        help
+            C3 无 PSRAM。整页 1-bit 位图约 100KB 可放 SRAM；
+            若 iOS 发来的原始 URF 任务过大，可先落 storage 分区再逐行解码。
+
+endmenu

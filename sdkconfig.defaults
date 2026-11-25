@@ -1,0 +1,80 @@
+# ============================================================
+# AirPrint Cat Printer - ESP32-C3 defaults
+# 用法: idf.py set-target esp32c3 && idf.py build
+# 注意: 配置项名称随 IDF 版本略有差异，若 menuconfig 中找不到某项，
+#       以 menuconfig 实际名称为准（注释已标注用途）。
+# ============================================================
+
+# --- AirPrint Cat Printer: 本机实测配置 ---
+CONFIG_AIRPRINT_PRINTER_NAME="catprint2"
+CONFIG_AIRPRINT_WIFI_SSID="360"
+CONFIG_AIRPRINT_WIFI_PASSWORD="13535871853"
+CONFIG_AIRPRINT_WIFI_BSSID=""
+CONFIG_CATPRINTER_BLE_NAME_PREFIX="PD01"
+
+# --- 打印头能量 ---
+# 0xFFFF 是硬件最大值；配合 apply_energy(0xBE 01) 会整页烧糊成黑块+条纹。
+# NaitLee/Cat-Printer 注释：固件默认约 0x3000（1/5）。调小更淡，调大更黑。
+CONFIG_CATPRINTER_ENERGY=0x3000
+
+# --- Target / Flash ---
+CONFIG_IDF_TARGET="esp32c3"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Bluetooth: 只开 NimBLE，关掉 Bluedroid 省 RAM ---
+# C3 是单核 400KB SRAM，Bluedroid 协议栈太重
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_GATTS_ENABLE=n
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_BONDS=0
+CONFIG_BT_NIMBLE_ATT_MTU=247
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=y
+
+# --- WiFi + BLE 软件共存（关键）---
+# 若 menuconfig 中名称不同，搜 "coex" 找对应项
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_ESP32_WIFI_SW_COEXIST_ENABLE=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+
+# --- mDNS (Bonjour 广播 _ipp._tcp) ---
+CONFIG_MDNS_MAX_SERVICES=4
+CONFIG_MDNS_TASK_STACK=4096
+CONFIG_MDNS_TASK_PRIORITY=5
+
+# --- HTTP server (IPP over port 631) ---
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_HTTPD_SERVER_MAX_QUEUED_REQ=8
+
+# --- lwIP TCP 接收窗口（打印速度关键）---
+# IDF 默认只有 5760 = 4*MSS，配合对端延迟 ACK，326KB 的 URF 上传实测要
+# 18.6s（约 17KB/s）。放大窗口后 iOS 可连续发送，不必每 5.7KB 等一次 ACK。
+# TCP_RECVMBOX_SIZE 同步加大，否则 mailbox 满会触发 zero-window/重传。
+# pbuf 来自静态 PBUF_POOL，不额外占用运行时 heap。
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+
+# TCP 定时器周期：IDF 默认 250 ms，delayed ACK 最迟要等一整个 tick。
+# iOS 的 chunked 上传是按 ACK 节奏推进的（实测用小 SO_SNDBUF 复现会直接
+# 卡死），250 ms 会把 175 KB 光栅拖到 ~20 s。50 ms 让 ACK 及时返回。
+# 代价是 TCP 定时器 5 倍频率，CPU 略增；上传与 BLE 打印分属两个阶段，
+# 不会在打印时争抢射频。
+CONFIG_LWIP_TCP_TMR_INTERVAL=50
+
+# --- 系统 ---
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_DEFAULT=y
+# 调试通过后可切 SIZE: CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_ESP_TASK_WDT_EN=y

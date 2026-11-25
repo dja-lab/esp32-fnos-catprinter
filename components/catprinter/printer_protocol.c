@@ -1,0 +1,196 @@
+#include "printer_protocol.h"
+
+#include <string.h>
+
+/* CRC-8 table from NaitLee/Cat-Printer commander.py (poly 0x07, init 0) */
+static const uint8_t s_crc8_table[256] = {
+    0x00, 0x07, 0x0e, 0x09, 0x1c, 0x1b, 0x12, 0x15,
+    0x38, 0x3f, 0x36, 0x31, 0x24, 0x23, 0x2a, 0x2d,
+    0x70, 0x77, 0x7e, 0x79, 0x6c, 0x6b, 0x62, 0x65,
+    0x48, 0x4f, 0x46, 0x41, 0x54, 0x53, 0x5a, 0x5d,
+    0xe0, 0xe7, 0xee, 0xe9, 0xfc, 0xfb, 0xf2, 0xf5,
+    0xd8, 0xdf, 0xd6, 0xd1, 0xc4, 0xc3, 0xca, 0xcd,
+    0x90, 0x97, 0x9e, 0x99, 0x8c, 0x8b, 0x82, 0x85,
+    0xa8, 0xaf, 0xa6, 0xa1, 0xb4, 0xb3, 0xba, 0xbd,
+    0xc7, 0xc0, 0xc9, 0xce, 0xdb, 0xdc, 0xd5, 0xd2,
+    0xff, 0xf8, 0xf1, 0xf6, 0xe3, 0xe4, 0xed, 0xea,
+    0xb7, 0xb0, 0xb9, 0xbe, 0xab, 0xac, 0xa5, 0xa2,
+    0x8f, 0x88, 0x81, 0x86, 0x93, 0x94, 0x9d, 0x9a,
+    0x27, 0x20, 0x29, 0x2e, 0x3b, 0x3c, 0x35, 0x32,
+    0x1f, 0x18, 0x11, 0x16, 0x03, 0x04, 0x0d, 0x0a,
+    0x57, 0x50, 0x59, 0x5e, 0x4b, 0x4c, 0x45, 0x42,
+    0x6f, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7d, 0x7a,
+    0x89, 0x8e, 0x87, 0x80, 0x95, 0x92, 0x9b, 0x9c,
+    0xb1, 0xb6, 0xbf, 0xb8, 0xad, 0xaa, 0xa3, 0xa4,
+    0xf9, 0xfe, 0xf7, 0xf0, 0xe5, 0xe2, 0xeb, 0xec,
+    0xc1, 0xc6, 0xcf, 0xc8, 0xdd, 0xda, 0xd3, 0xd4,
+    0x69, 0x6e, 0x67, 0x60, 0x75, 0x72, 0x7b, 0x7c,
+    0x51, 0x56, 0x5f, 0x58, 0x4d, 0x4a, 0x43, 0x44,
+    0x19, 0x1e, 0x17, 0x10, 0x05, 0x02, 0x0b, 0x0c,
+    0x21, 0x26, 0x2f, 0x28, 0x3d, 0x3a, 0x33, 0x34,
+    0x4e, 0x49, 0x40, 0x47, 0x52, 0x55, 0x5c, 0x5b,
+    0x76, 0x71, 0x78, 0x7f, 0x6a, 0x6d, 0x64, 0x63,
+    0x3e, 0x39, 0x30, 0x37, 0x22, 0x25, 0x2c, 0x2b,
+    0x06, 0x01, 0x08, 0x0f, 0x1a, 0x1d, 0x14, 0x13,
+    0xae, 0xa9, 0xa0, 0xa7, 0xb2, 0xb5, 0xbc, 0xbb,
+    0x96, 0x91, 0x98, 0x9f, 0x8a, 0x8d, 0x84, 0x83,
+    0xde, 0xd9, 0xd0, 0xd7, 0xc2, 0xc5, 0xcc, 0xcb,
+    0xe6, 0xe1, 0xe8, 0xef, 0xfa, 0xfd, 0xf4, 0xf3
+};
+
+const uint8_t PP_FLOW_PAUSE[9]  = {0x51, 0x78, 0xae, 0x01, 0x01, 0x00, 0x10, 0x70, 0xff};
+const uint8_t PP_FLOW_RESUME[9] = {0x51, 0x78, 0xae, 0x01, 0x01, 0x00, 0x00, 0x00, 0xff};
+
+static const uint8_t s_lattice_start[11] = {
+    0xaa, 0x55, 0x17, 0x38, 0x44, 0x5f, 0x5f, 0x5f, 0x44, 0x38, 0x2c
+};
+static const uint8_t s_lattice_end[11] = {
+    0xaa, 0x55, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17
+};
+
+uint8_t pp_crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc = s_crc8_table[(crc ^ data[i]) & 0xffu];
+    }
+    return crc;
+}
+
+uint8_t pp_reverse_bits(uint8_t b)
+{
+    b = (uint8_t)(((b & 0xaa) >> 1) | ((b & 0x55) << 1));
+    b = (uint8_t)(((b & 0xcc) >> 2) | ((b & 0x33) << 2));
+    return (uint8_t)(((b & 0xf0) >> 4) | ((b & 0x0f) << 4));
+}
+
+size_t pp_make_command(uint8_t *out, size_t out_cap,
+                       uint8_t cmd, const uint8_t *payload, size_t payload_len)
+{
+    if (out == NULL || payload_len > 0xffu) {
+        return 0;
+    }
+    if (payload_len > 0 && payload == NULL) {
+        return 0;
+    }
+    if (out_cap < 6u + payload_len + 2u) {
+        return 0;
+    }
+
+    out[0] = PP_FRAME_H0;
+    out[1] = PP_FRAME_H1;
+    out[2] = cmd;
+    out[3] = 0x00;
+    out[4] = (uint8_t)payload_len;
+    out[5] = 0x00;
+    if (payload_len > 0) {
+        memcpy(&out[6], payload, payload_len);
+    }
+    out[6 + payload_len] = pp_crc8(payload, payload_len);
+    out[7 + payload_len] = PP_FRAME_TAIL;
+    return 8u + payload_len;
+}
+
+static size_t put_le16(uint8_t *dst, uint16_t v)
+{
+    dst[0] = (uint8_t)(v & 0xffu);
+    dst[1] = (uint8_t)(v >> 8);
+    return 2;
+}
+
+size_t pp_cmd_get_state(uint8_t *out, size_t cap)
+{
+    uint8_t p = 0;
+    return pp_make_command(out, cap, PP_CMD_GET_STATE, &p, 1);
+}
+
+size_t pp_cmd_get_info(uint8_t *out, size_t cap)
+{
+    uint8_t p = 0;
+    return pp_make_command(out, cap, PP_CMD_GET_INFO, &p, 1);
+}
+
+size_t pp_cmd_update_device(uint8_t *out, size_t cap)
+{
+    uint8_t p = 0;
+    return pp_make_command(out, cap, PP_CMD_UPDATE_DEVICE, &p, 1);
+}
+
+size_t pp_cmd_start_printing(uint8_t *out, size_t cap, int new_kind)
+{
+    uint8_t tmp[PP_FRAME_MAX];
+    uint8_t p = 0;
+    size_t n = pp_make_command(tmp, sizeof(tmp), PP_CMD_GET_STATE, &p, 1);
+    if (n == 0) {
+        return 0;
+    }
+    if (!new_kind) {
+        if (cap < n) return 0;
+        memcpy(out, tmp, n);
+        return n;
+    }
+    if (cap < n + 1) return 0;
+    out[0] = 0x12;  /* prefix used by start_printing_new() */
+    memcpy(&out[1], tmp, n);
+    return n + 1;
+}
+
+size_t pp_cmd_set_dpi_200(uint8_t *out, size_t cap)
+{
+    uint8_t p = 50;  /* set_dpi_as_200() passes int_to_bytes(50) */
+    return pp_make_command(out, cap, PP_CMD_SET_DPI, &p, 1);
+}
+
+size_t pp_cmd_set_speed(uint8_t *out, size_t cap, uint8_t speed)
+{
+    return pp_make_command(out, cap, PP_CMD_SET_SPEED, &speed, 1);
+}
+
+size_t pp_cmd_set_energy(uint8_t *out, size_t cap, uint16_t energy)
+{
+    uint8_t p[2];
+    put_le16(p, energy);
+    return pp_make_command(out, cap, PP_CMD_SET_ENERGY, p, 2);
+}
+
+size_t pp_cmd_apply_energy(uint8_t *out, size_t cap)
+{
+    uint8_t p = 1;
+    return pp_make_command(out, cap, PP_CMD_APPLY_ENERGY, &p, 1);
+}
+
+size_t pp_cmd_feed(uint8_t *out, size_t cap, uint16_t pixels)
+{
+    uint8_t p[2];
+    put_le16(p, pixels);
+    return pp_make_command(out, cap, PP_CMD_FEED, p, 2);
+}
+
+size_t pp_cmd_retract(uint8_t *out, size_t cap, uint16_t pixels)
+{
+    uint8_t p[2];
+    put_le16(p, pixels);
+    return pp_make_command(out, cap, PP_CMD_RETRACT, p, 2);
+}
+
+size_t pp_cmd_start_lattice(uint8_t *out, size_t cap)
+{
+    return pp_make_command(out, cap, PP_CMD_LATTICE, s_lattice_start, sizeof(s_lattice_start));
+}
+
+size_t pp_cmd_end_lattice(uint8_t *out, size_t cap)
+{
+    return pp_make_command(out, cap, PP_CMD_LATTICE, s_lattice_end, sizeof(s_lattice_end));
+}
+
+size_t pp_cmd_draw_row(uint8_t *out, size_t cap, const uint8_t *row)
+{
+    uint8_t payload[PP_ROW_BYTES];
+    if (row == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < PP_ROW_BYTES; i++) {
+        payload[i] = pp_reverse_bits(row[i]);
+    }
+    return pp_make_command(out, cap, PP_CMD_DRAW_BITMAP, payload, PP_ROW_BYTES);
+}
