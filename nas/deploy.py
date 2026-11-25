@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Deploy nas/ to the fnOS NAS and run setup.sh via sudo."""
+import getpass
 import os
 import sys
 import paramiko
 
-NAS_HOST = "192.168.1.17"
-NAS_USER = "dja"
-NAS_PASS = "<REDACTED>"
+# Override via environment:  NAS_HOST / NAS_USER / NAS_PASS (asked if unset)
+NAS_HOST = os.environ.get("NAS_HOST", "192.168.1.17")
+NAS_USER = os.environ.get("NAS_USER", "dja")
+NAS_PASS = os.environ.get("NAS_PASS")
 LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_DIR = "/tmp/catbridge-deploy"
 
 
-def run(ssh, cmd, timeout=90):
+def run(ssh, cmd, timeout=90, input=None):
     chan = ssh.get_transport().open_session()
     chan.settimeout(timeout)
     chan.exec_command(cmd)
+    if input:
+        chan.sendall(input.encode())
+        chan.shutdown_write()
     out = b""
     while True:
         if chan.recv_ready():
@@ -43,6 +48,8 @@ def upload_dir(sftp, local, remote):
 
 
 def main():
+    if not NAS_PASS:
+        NAS_PASS = getpass.getpass("NAS %s@%s password: " % (NAS_USER, NAS_HOST))
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(NAS_HOST, username=NAS_USER, password=NAS_PASS, timeout=15)
@@ -55,8 +62,8 @@ def main():
 
     print("== running setup.sh (sudo)")
     rc, out = run(ssh,
-                  "echo %s | sudo -S -p '' sh %s/setup.sh" % (NAS_PASS, REMOTE_DIR),
-                  timeout=600)
+                  "sudo -S -p '' sh %s/setup.sh" % REMOTE_DIR,
+                  timeout=600, input=NAS_PASS + "\n")
     print(out)
     print("== setup rc=%d" % rc)
 
