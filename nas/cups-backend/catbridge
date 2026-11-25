@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""CUPS backend: catbridge://<esp32-host>  ->  POST raw URF to the ESP32 BLE bridge.
+
+Installed as /usr/lib/cups/backend/catbridge on the NAS. CUPS hands us an
+image/urf document (the PPD's *cupsFilter2 passes the client raster through
+unchanged) and we relay it to the ESP32 bridge firmware:
+
+    NAS CUPS --stdin URF--> this script --POST /print--> ESP32 --BLE--> printer
+
+Called by cupsd in two ways:
+  no args            -> discovery: list the configured bridge device
+  6 args             -> print: job-id user title copies options <file-or-"-">
+
+Exit 0 = job accepted by the bridge; non-zero = failed (CUPS will retry per
+its error policy).
+"""
+import os
+import sys
+import urllib.request
+import urllib.error
+
+# ESP32 bridge address. Override without editing this file:
+#   echo 'export CATBRIDGE_HOST=192.168.1.x' >> /etc/cups/catbridge.env
+DEFAULT_HOST = "192.168.1.21"
+PORT = 80
+# BLE thermal printing is slow by design: an A6 page takes ~30 s, a multi-page
+# A4 document several minutes. The bridge holds the connection while it
+# decodes and prints, so we must wait it out.
+UPLOAD_TIMEOUT_S = 600
+
+
+def bridge_url():
+    host = os.environ.get("CATBRIDGE_HOST", DEFAULT_HOST)
+    return "http://%s:%d/print" % (host, PORT)
+
+
+def discovery():
+    host = os.environ.get("CATBRIDGE_HOST", DEFAULT_HOST)
+    uri = "catbridge://%s" % host
+    print('network %s "CatPrint BLE bridge" "ESP32-C3 BLE Cat Printer"' % uri)
+    return 0
+
+
+def relay(filename):
+    if filename and filename != "-":
+        with open(filename, "rb") as f:
+            data = f.read()
+    else:
+        data = sys.stdin.buffer.read()
+
+    if not data.startswith(b"UNIRAST"):
+        print("ERROR: catbridge: job is not a UNIRAST raster (%d bytes, starts %r)"
+              % (len(data), data[:8]), file=sys.stderr)
+        return 1
+
+    req = urllib.request.Request(
+        bridge_url(),
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT_S) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            print("INFO: catbridge: bridge answered %s: %s"
+                  % (resp.status, body[:120]), file=sys.stderr)
+            return 0 if resp.status == 200 else 1
+    except urllib.error.HTTPError as e:
+        print("ERROR: catbridge: bridge rejected the job: HTTP %d (%s)"
+              % (e.code, e.reason), file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 - backend must not crash
+        print("ERROR: catbridge: cannot reach bridge: %s" % e, file=sys.stderr)
+        return 1
+
+
+def main():
+    if len(sys.argv) == 1:
+        return discovery()
+    if len(sys.argv) < 7:
+        print("ERROR: catbridge: bad arguments: %r" % sys.argv, file=sys.stderr)
+        return 1
+    return relay(sys.argv[6])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
