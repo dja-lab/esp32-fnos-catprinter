@@ -17,6 +17,7 @@
  * media negotiation, multi-value/collection pitfalls - none of it is needed
  * when the only client is our own NAS backend.
  */
+#include "catprinter.h"
 #include "printserver.h"
 #include "settings.h"
 #include "urf_stream.h"
@@ -451,6 +452,59 @@ static void handle_print(int fd, worker_ctx_t *ctx, body_t *body,
     send_json(fd, json);
 }
 
+/* ---- POST /raw: pure byte relay -----------------------------------------
+ * Body = a fully-formed printer command stream (frames + CRC8 built by the
+ * NAS backend). Pushed to 0xAE01 verbatim through cp_send_raw(), which
+ * handles MTU chunking and the printer's flow-control notifications; each
+ * relayed chunk applies TCP back-pressure to the sender. No decode, no
+ * buffering, no local settings - the NAS decides everything. */
+static volatile bool s_raw_busy = false;
+
+static void handle_raw(int fd, worker_ctx_t *ctx, body_t *body, const char *peer)
+{
+    if (s_raw_busy) {
+        body_drain(body);
+        send_err(fd, 503, "Busy");
+        return;
+    }
+    if (!cp_is_ready()) {
+        body_drain(body);
+        send_err(fd, 503, "Printer not connected");
+        return;
+    }
+    s_raw_busy = true;
+    size_t total = 0;
+    esp_err_t err = ESP_OK;
+    int64_t start_us = esp_timer_get_time();
+    for (;;) {
+        int got = body_read(body, ctx->scratch, sizeof(ctx->scratch));
+        if (got < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        err = cp_send_raw(ctx->scratch, (size_t)got, 60000);
+        if (err != ESP_OK) {
+            break;
+        }
+        total += (size_t)got;
+    }
+    s_raw_busy = false;
+    ESP_LOGI(TAG, "raw relay %s: %u B in %u ms, peer=%s, heap %u",
+             err == ESP_OK ? "ok" : "FAILED", (unsigned)total,
+             (unsigned)((esp_timer_get_time() - start_us) / 1000),
+             peer, (unsigned)esp_get_free_heap_size());
+    if (err != ESP_OK) {
+        send_err(fd, 500, "BLE relay failed");
+        return;
+    }
+    char json[96];
+    snprintf(json, sizeof(json), "{\"ok\":true,\"bytes\":%u}", (unsigned)total);
+    send_json(fd, json);
+}
+
 /* ---- one client -------------------------------------------------------- */
 static void handle_client(int fd, worker_ctx_t *ctx)
 {
@@ -524,7 +578,9 @@ static void handle_client(int fd, worker_ctx_t *ctx)
         webui_api(fd, path, (const char *)buf, blen);
         return;
     }
-    if (strcmp(method, "POST") != 0 || strcmp(path, "/print") != 0) {
+    bool is_print = (strcmp(path, "/print") == 0);
+    bool is_raw = (strcmp(path, "/raw") == 0);
+    if (strcmp(method, "POST") != 0 || (!is_print && !is_raw)) {
         send_err(fd, 404, "Not Found");
         return;
     }
@@ -542,6 +598,10 @@ static void handle_client(int fd, worker_ctx_t *ctx)
     }
     body_t body;
     body_init(&body, &brd, chunked, content_len);
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/raw") == 0) {
+        handle_raw(fd, ctx, &body, peer);
+        return;
+    }
     handle_print(fd, ctx, &body, chunked, content_len, peer);
 }
 
