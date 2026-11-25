@@ -9,7 +9,8 @@ unchanged) and we relay it to the ESP32 bridge firmware:
 
 Called by cupsd in two ways:
   no args            -> discovery: list the configured bridge device
-  6 args             -> print: job-id user title copies options <file-or-"-">
+  7 args             -> print: job-id user title copies options <file>
+  6 args             -> print: job data arrives on stdin (CUPS stdin mode)
 
 Exit 0 = job accepted by the bridge; non-zero = failed (CUPS will retry per
 its error policy).
@@ -77,10 +78,13 @@ def relay(filename):
 def main():
     if len(sys.argv) == 1:
         return discovery()
-    if len(sys.argv) < 7:
-        print("ERROR: catbridge: bad arguments: %r" % sys.argv, file=sys.stderr)
-        return 1
-    return relay(sys.argv[6])
+    if len(sys.argv) >= 7:
+        return relay(sys.argv[6])
+    if len(sys.argv) == 6:
+        # CUPS stdin mode: no filename argument, the job data is piped in.
+        return relay("-")
+    print("ERROR: catbridge: bad arguments: %r" % sys.argv, file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
